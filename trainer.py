@@ -10,7 +10,7 @@ import cv2
 
 """ param """
 alpha_span = 800000
-batch_size = 14 # 256:14 512:6 640:3
+batch_size = 32 # 256:14 512:6 640:3
 epoch = (alpha_span * 2 // 4936) # 4936 is number of images
 lr = 0.001
 z_dim = 512
@@ -19,7 +19,7 @@ n_critic = 1
 ksz = 3
 gin_ch1 = [512,512,512,512,256,128,64,32]
 gout_ch1 = [512,512,512,256,128,64,32,16]
-target_size = 256
+target_size = 64
 mean_img = np.zeros([640,640,3], dtype='float32')
 initial_size = 4
 
@@ -39,7 +39,8 @@ def weight(shape, name):
         coef = math.sqrt( 2.0 / shape[0] )
     print(name + ' ' + str(coef))
     with tf.variable_scope("x", reuse=tf.AUTO_REUSE):
-        v = tf.get_variable(name, shape=shape, dtype=tf.float32, initializer=tf.truncated_normal_initializer()) #tf.contrib.layers.xavier_initializer())#tf.contrib.layers.variance_scaling_initializer())
+        v = tf.get_variable(name, shape=shape, dtype=tf.float32, initializer=tf.initializers.random_normal())
+        #tf.contrib.layers.xavier_initializer())#tf.contrib.layers.variance_scaling_initializer())
         v = tf.multiply(tf.constant(coef, shape=shape), v)# coef * v
     return v
     
@@ -48,15 +49,21 @@ def bias(shape, name):
         b = tf.get_variable(name, shape=shape, dtype=tf.float32, initializer=tf.zeros_initializer)
     return b
 
-def norm_scale(z, shape):
-    m = tf.add(tf.constant(1e-8, shape=shape), tf.sqrt(tf.reduce_mean(tf.square(z),axis=0,keepdims=True)))
-    return tf.div(z, m)#tf.constant(1.0 / m + 1e-8, shape=shape))
-
+def norm_scale(z,ch):
+    m = tf.sqrt(tf.add(tf.constant(1e-8, shape=z.get_shape()), tf.reduce_mean(tf.square(z),axis=0,keepdims=True)))
+    #return tf.nn.lrn(z,depth_radius=0,bias=1e-8,alpha=(1.0/ch),beta=0.5)
+    return tf.div(z, m)
+    
 def upsample(z, size):
     return tf.image.resize_nearest_neighbor(z, [size, size])
     
+def down_up(z):
+    hh = z.get_shape()[1]
+    ww = z.get_shape()[2]
+    return tf.image.resize_nearest_neighbor(tf.image.resize_images(z, [hh//2,ww//2], method=tf.image.ResizeMethod.AREA), [hh,ww])
+    
 def downsample(z):
-    return tf.nn.avg_pool(z, [1,2,2,1], [1,2,2,1], 'SAME')
+    return tf.nn.avg_pool(z, [1,2,2,1], [1,2,2,1], 'VALID')
     
 def gen_5(z):
     base_channel = 512
@@ -68,10 +75,10 @@ def gen_5(z):
     # tensor, filter, output_size, stride
     outsize = [batch_size, initial_size, initial_size, base_channel]
     m = tf.nn.bias_add(tf.nn.conv2d_transpose(a, g1_1, outsize, [1,initial_size,initial_size,1]), g1_1b)
-    b = tf.nn.leaky_relu(norm_scale(m, outsize))
+    b = norm_scale(tf.nn.leaky_relu(m),1)
     # tensor, filter, stride, padding
     bb = tf.nn.bias_add(tf.nn.conv2d(b, g1_2, [1,1,1,1], 'SAME'), g1_2b)
-    return tf.nn.leaky_relu(norm_scale(bb, outsize))
+    return norm_scale(tf.nn.leaky_relu(bb),base_channel)
     
 def discr_5(z):
     # todo : minibatch norm
@@ -82,12 +89,22 @@ def discr_5(z):
     d1_2b = bias([base_channel], 'd1_2b')
     d1_3 = weight([base_channel, 1], 'd1_3') # fullcon : flatten after batch axis and matmul
     d1_3b = bias([1], 'd1_3b')
-    n = tf.constant(1.0 / batch_size, shape=[1, initial_size, initial_size, base_channel])
-    m = tf.multiply(tf.reduce_sum(z, axis = 0), n)
-    s = tf.multiply(tf.reduce_sum(tf.square(z), axis = 0), n)
-    sdev = tf.reduce_mean(tf.sqrt(tf.subtract(s, tf.multiply(m,m))))
-    dd = tf.fill([batch_size, initial_size, initial_size, 1], sdev)
-    zz = tf.concat([z, dd], axis=3)
+    #n = tf.constant(1.0 / batch_size, shape=[1, initial_size, initial_size, base_channel])
+    
+    group_size = tf.minimum(4, batch_size)     # Minibatch must be divisible by (or smaller than) group_size.
+    s = z.shape                                             # [NCHW]  Input shape.
+    y = tf.reshape(z, [group_size, -1, s[1], s[2], s[3]])   # [GMCHW] Split minibatch into M groups of size G.
+    y = tf.cast(y, tf.float32)                              # [GMCHW] Cast to FP32.
+    y -= tf.reduce_mean(y, axis=0, keepdims=True)           # [GMCHW] Subtract mean over group.
+    y = tf.reduce_mean(tf.square(y), axis=0)                # [MCHW]  Calc variance over group.
+    y = tf.sqrt(y + 1e-8)                                   # [MCHW]  Calc stddev over group.
+    y = tf.reduce_mean(y, axis=[1,2,3], keepdims=True)      # [M111]  Take average over fmaps and pixels.
+    y = tf.cast(y, z.dtype)                                 # [M111]  Cast back to original data type.
+    y = tf.tile(y, [group_size, s[1], s[2], 1])             # [N1HW]  Replicate over group and pixels.
+    zz = tf.concat([z, y], axis=3)                          # [NCHW]  Append as new fmap.
+    #sdev = tf.reduce_mean(tf.sqrt(tf.subtract(tf.reduce_mean(tf.square(z), axis = 0), tf.square(tf.reduce_mean(z, axis = 0)))))
+    #dd = tf.fill([batch_size, initial_size, initial_size, 1], sdev)
+    #zz = tf.concat([z, dd], axis=3)
     d0 = tf.nn.bias_add(tf.nn.conv2d(zz, d1_1, [1,1,1,1], 'SAME'), d1_1b)
     d1 = tf.nn.leaky_relu(d0)
     d2 = tf.nn.bias_add(tf.nn.conv2d(d1, d1_2, [1,1,1,1], 'VALID'), d1_2b)
@@ -97,12 +114,16 @@ def discr_5(z):
 
 def toRGB(z, sz, tsz):
     grgb = weight([1,1,sz,3], 'grgb'+str(tsz))
-    return tf.nn.conv2d(z, grgb, [1,1,1,1], 'SAME')
+    grgb_b = bias([3], 'grgb'+str(tsz)+'_b')
+    return tf.nn.bias_add(tf.nn.conv2d(z, grgb, [1,1,1,1], 'SAME'), grgb_b)
 
 def fromRGB(z, sz, tsz):
     drgb = weight([1,1,3,sz], 'drgb'+str(tsz))
-    return tf.nn.leaky_relu(tf.nn.conv2d(z, drgb, [1,1,1,1], 'SAME'))
+    drgb_b = bias([sz], 'drgb'+str(tsz)+'_b')
+    return tf.nn.leaky_relu(tf.nn.bias_add(tf.nn.conv2d(z, drgb, [1,1,1,1], 'SAME'), drgb_b))
 
+
+    
 def generator(z, alpha):
     d = gen_5(z)
     sz = initial_size
@@ -113,8 +134,8 @@ def generator(z, alpha):
         b1 = bias([gout_ch1[cnt]], 'g'+str(1+cnt)+'_1b')
         w2 = weight([ksz,ksz,gout_ch1[cnt],gout_ch1[cnt]], 'g'+str(1+cnt)+'_2')
         b2 = bias([gout_ch1[cnt]], 'g'+str(1+cnt)+'_2b')
-        d = tf.nn.leaky_relu(norm_scale(tf.nn.bias_add(tf.nn.conv2d(upsample(d, 2*sz), w1, [1,1,1,1], 'SAME'), b1), [batch_size, 2*sz, 2*sz, gout_ch1[cnt]]))
-        d = tf.nn.leaky_relu(norm_scale(tf.nn.bias_add(tf.nn.conv2d(d, w2, [1,1,1,1], 'SAME'), b2), [batch_size, 2*sz, 2*sz, gout_ch1[cnt]]))
+        d = norm_scale(tf.nn.leaky_relu(tf.nn.bias_add(tf.nn.conv2d(upsample(d, 2*sz), w1, [1,1,1,1], 'SAME'), b1)),gout_ch1[cnt])
+        d = norm_scale(tf.nn.leaky_relu(tf.nn.bias_add(tf.nn.conv2d(d, w2, [1,1,1,1], 'SAME'), b2)),gout_ch1[cnt])
         if sz * 2 == target_size :
             c = tf.subtract(tf.constant(1.0, shape=[batch_size, target_size, target_size, 3]), tf.fill([batch_size, target_size, target_size, 3], alpha))
             dd = tf.multiply(c, toRGB(upsample(p, target_size), gout_ch1[cnt-1],target_size//2))
@@ -166,6 +187,10 @@ with tf.device('/gpu:%d' % gpu_id):
     z = tf.placeholder(tf.float32, shape=[batch_size, z_dim])
     alpha = tf.placeholder(tf.float32)
     
+    if target_size > 4:
+        coef = tf.subtract(tf.constant(1.0, shape=real.get_shape()), tf.fill(real.get_shape(), alpha))
+        real = tf.add(tf.multiply(coef, down_up(real)), tf.multiply(tf.fill(real.get_shape(), alpha), real))
+
     # generate
     fake = generator(z, alpha)
 
@@ -176,11 +201,13 @@ with tf.device('/gpu:%d' % gpu_id):
     # losses
     def gradient_penalty(real, fake, f):
         def interpolate(a, b):
-            shape = tf.concat((tf.shape(a)[0:1], tf.tile([1], [a.shape.ndims - 1])), axis=0)
-            alpha_ = tf.random_uniform(shape=shape, minval=0., maxval=1.)
-            inter = a + alpha_ * (b - a)
-            inter.set_shape(a.get_shape().as_list())
-            return inter
+            #shape = tf.concat((tf.shape(a)[0:1], tf.tile([1], [a.shape.ndims - 1])), axis=0)
+            rg = tf.image.resize_nearest_neighbor(tf.random_uniform(shape=[batch_size, 1, 1, 1], minval=0., maxval=1.), [target_size, target_size])
+            rg = tf.concat([rg, rg, rg], axis=3)
+            return tf.add(tf.multiply(rg, a), tf.multiply(tf.subtract(tf.constant(1.0, shape=[batch_size, target_size, target_size, 3]), rg), b))
+            #inter = a + alpha_ * (b - a)
+            #inter.set_shape(a.get_shape().as_list())
+            #return inter
 
         x = interpolate(real, fake)
         pred = f(x, alpha)
@@ -281,16 +308,17 @@ for it in range(sess.run(it_cnt), max_it):
     for i in range(n_critic):
         # batch data
         real_ipt = data_pool.batch()
+        
         z_ipt = get_input()# np.random.normal(size=[batch_size, z_dim])
-        d_summary_opt, _, lossd = sess.run([d_summary, d_step, d_loss], feed_dict={real: real_ipt, z: z_ipt, alpha: alpha_ipt})
-        print ('loss_d = ' + repr(lossd))
+        d_summary_opt, _ = sess.run([d_summary, d_step], feed_dict={real: real_ipt, z: z_ipt, alpha: alpha_ipt})
+        #print ('loss_d = ' + repr(lossd))
     summary_writer.add_summary(d_summary_opt, it)
 
     # train G
     z_ipt = get_input()# np.random.normal(size=[batch_size, z_dim])
-    g_summary_opt, _, lossg = sess.run([g_summary, g_step, g_loss], feed_dict={z: z_ipt, alpha : alpha_ipt})
+    g_summary_opt, _ = sess.run([g_summary, g_step], feed_dict={z: z_ipt, alpha : alpha_ipt})
     summary_writer.add_summary(g_summary_opt, it)
-    print ('loss_g = ' + repr(lossg))
+    #print ('loss_g = ' + repr(lossg))
 
     # display
     if it % 1 == 0:
@@ -307,4 +335,5 @@ for it in range(sess.run(it_cnt), max_it):
         f_sample_opt = np.clip(f_sample_opt, -1, 1)
         save_dir = './sample_images_while_training/wgp'
         utils.mkdir(save_dir + '/')
-        utils.imwrite(utils.immerge(f_sample_opt, 4, 4), '%s/Epoch_(%d)_(%dof%d).png' % (save_dir, epoch, it_epoch, batch_epoch))
+        osz = int(math.sqrt(batch_size))+1
+        utils.imwrite(utils.immerge(f_sample_opt, osz, osz), '%s/Epoch_(%d)_(%dof%d).png' % (save_dir, epoch, it_epoch, batch_epoch))
