@@ -1,6 +1,12 @@
 # PGGAN
 
-An implementation of Progressive Growing GAN (https://arxiv.org/pdf/1710.10196.pdf) by tensorflow.
+Additional tests of PGGAN (https://arxiv.org/pdf/1710.10196.pdf) by tensorflow.
+
+# Dataset
+
+4936 facial images of Japanese idols. 
+
+# Test Results
 
 ## 4x4
 ![result of 4x4](/samples/4x4.png)
