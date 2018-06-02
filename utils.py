@@ -119,7 +119,7 @@ def disk_image_batch(image_paths, batch_size, shape, preprocess_fn=None, shuffle
 
 class DiskImageData:
 
-    def __init__(self, image_paths, batch_size, shape, preprocess_fn=None, shuffle=True, num_threads=16,
+    def __init__(self, cpuid, image_paths, batch_size, shape, preprocess_fn=None, shuffle=True, num_threads=16,
                  min_after_dequeue=100, allow_smaller_final_batch=False, scope=None):
         """
         This function is suitable for bmp, jpg, png and gif files
@@ -132,7 +132,7 @@ class DiskImageData:
             # @TODO
             # There are some strange errors if the gpu device is the
             # same with the main graph, but cpu device is ok. I don't know why...
-            with tf.device('/cpu:0'):
+            with tf.device('/cpu:%d' % cpuid ):
                 self._batch_ops, self._data_num = disk_image_batch(image_paths, batch_size, shape, preprocess_fn, shuffle, num_threads,
                                                                    min_after_dequeue, allow_smaller_final_batch, scope)
 
@@ -150,7 +150,7 @@ class DiskImageData:
     def __del__(self):
         print(' [*] DiskImageData: stop threads and close session!')
         self.coord.request_stop()
-        self.coord.join(self.threads)
+        self.coord.join(self.threads, stop_grace_period_secs=1, ignore_live_threads=True)
         self.sess.close()
 
 
